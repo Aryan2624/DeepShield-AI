@@ -1,0 +1,19 @@
+{
+    "model_name": "Random Forest",
+    "test_samples": 96167,
+    "feature_count": 30,
+    "accuracy": 0.9342082003181965,
+    "precision_macro": 0.909711581303452,
+    "recall_macro": 0.9304109743007538,
+    "f1_macro": 0.9186287564770315,
+    "precision_weighted": 0.9393980666454225,
+    "recall_weighted": 0.9342082003181965,
+    "f1_weighted": 0.9357684469413329,
+    "roc_auc_macro": 0.9898830758518934,
+    "classes": [
+        "benign",
+        "defacement",
+        "malware",
+        "phishing"
+    ]
+}
