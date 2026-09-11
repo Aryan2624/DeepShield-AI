@@ -54,3 +54,6 @@ datasets/*
 # Windows / macOS
 Thumbs.db
 .DS_Store
+# Trained ML models
+backend/ml/saved_models/*
+!backend/ml/saved_models/README.md
