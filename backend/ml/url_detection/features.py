@@ -1,9 +1,8 @@
 import ipaddress
 import math
 import re
-
 from collections import Counter
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 
 SUSPICIOUS_KEYWORDS = {
@@ -33,7 +32,7 @@ SUSPICIOUS_KEYWORDS = {
 }
 
 
-SHORTENER_DOMAINS = {
+SHORTENED_URL_DOMAINS = {
     "bit.ly",
     "tinyurl.com",
     "t.co",
@@ -64,528 +63,496 @@ SUSPICIOUS_EXTENSIONS = {
 }
 
 
-def prepare_url_for_parsing(url: str) -> str:
-    """
-    Add a temporary scheme when the URL has no scheme.
-
-    The original URL remains unchanged for lexical features.
-    """
-
-    url = str(url).strip()
-
-    if not re.match(
-        r"^[a-zA-Z][a-zA-Z0-9+.-]*://",
-        url,
-    ):
-        return "http://" + url
-
-    return url
+SCHEME_PATTERN = re.compile(
+    r"^[a-zA-Z][a-zA-Z0-9+.-]*://"
+)
 
 
 def safe_parse_url(url: str):
     """
-    Parse a URL without allowing malformed URLs to crash preprocessing.
+    Parse a URL safely.
 
-    Returns:
-        parsed_url
-        hostname
-        parse_error
-
-    parse_error:
-        0 -> parsed normally
-        1 -> malformed URL required fallback handling
+    URLs without a scheme are temporarily given http:// only for parsing.
+    The temporary scheme is never used in lexical feature calculation.
     """
 
-    prepared_url = prepare_url_for_parsing(url)
+    parse_error = 0
+
+    value = url.strip()
+
+    if value.startswith("//"):
+        parse_value = "http:" + value
+    elif SCHEME_PATTERN.match(value):
+        parse_value = value
+    else:
+        parse_value = "http://" + value
 
     try:
-        parsed_url = urlparse(prepared_url)
+        parsed = urlsplit(parse_value)
 
-        hostname = (
-            parsed_url.hostname or ""
-        ).lower()
+        # Access hostname here because malformed brackets can
+        # raise ValueError only when hostname is requested.
+        _ = parsed.hostname
 
-        return (
-            parsed_url,
-            hostname,
-            0,
-        )
+        return parsed, parse_error
 
     except (ValueError, UnicodeError):
-        pass
+        parse_error = 1
 
-
-    # Some malformed URLs contain invalid square brackets.
-    # Python may interpret these as broken IPv6 addresses.
-    sanitized_url = (
-        prepared_url
+    # Retry malformed brackets in a safer representation.
+    repaired = (
+        parse_value
         .replace("[", "%5B")
         .replace("]", "%5D")
     )
 
     try:
-        parsed_url = urlparse(
-            sanitized_url
-        )
+        parsed = urlsplit(repaired)
+        _ = parsed.hostname
 
-        hostname = (
-            parsed_url.hostname or ""
-        ).lower()
-
-        return (
-            parsed_url,
-            hostname,
-            1,
-        )
+        return parsed, parse_error
 
     except (ValueError, UnicodeError):
-        return (
-            None,
-            "",
-            1,
-        )
+        return None, parse_error
 
 
-def calculate_entropy(text: str) -> float:
+def get_hostname(parsed) -> str:
+    if parsed is None:
+        return ""
+
+    try:
+        hostname = parsed.hostname or ""
+    except (ValueError, UnicodeError):
+        return ""
+
+    hostname = hostname.strip().lower().rstrip(".")
+
+    return hostname
+
+
+def normalize_hostname(hostname: str) -> str:
     """
-    Calculate Shannon entropy.
-    """
-
-    if not text:
-        return 0.0
-
-    counts = Counter(text)
-
-    length = len(text)
-
-    entropy = 0.0
-
-    for count in counts.values():
-
-        probability = (
-            count / length
-        )
-
-        entropy -= (
-            probability
-            * math.log2(probability)
-        )
-
-    return entropy
-
-
-def contains_ip_address(hostname: str) -> int:
-    """
-    Detect IPv4 or IPv6 hostnames.
+    Remove the common www. prefix so:
+    google.com
+    www.google.com
+    are treated similarly by lexical features.
     """
 
+    if hostname.startswith("www."):
+        return hostname[4:]
+
+    return hostname
+
+
+def normalize_path(path: str) -> str:
+    """
+    Treat a root slash as an empty path.
+
+    example.com
+    example.com/
+
+    should not become meaningfully different samples.
+    """
+
+    if not path or path == "/":
+        return ""
+
+    return path
+
+
+def is_ip_address(hostname: str) -> int:
     if not hostname:
         return 0
 
-    clean_hostname = (
-        hostname.strip("[]")
-    )
+    candidate = hostname
+
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
 
     try:
-        ipaddress.ip_address(
-            clean_hostname
-        )
-
+        ipaddress.ip_address(candidate)
         return 1
-
     except ValueError:
         return 0
 
 
 def count_subdomains(hostname: str) -> int:
     """
-    Estimate subdomain count.
+    Approximate subdomain count.
 
-    Examples:
-        example.com -> 0
-        login.example.com -> 1
-
-    IP addresses always return 0.
+    Leading www is already removed.
+    IP addresses return zero.
     """
 
     if not hostname:
         return 0
 
-    hostname = (
-        hostname
-        .lower()
-        .strip(".")
-    )
-
-    if contains_ip_address(
-        hostname
-    ):
+    if is_ip_address(hostname):
         return 0
 
-    if hostname.startswith("www."):
-        hostname = hostname[4:]
-
-    labels = [
+    parts = [
         part
         for part in hostname.split(".")
         if part
     ]
 
-    if len(labels) <= 2:
+    if len(parts) <= 2:
         return 0
 
-    return len(labels) - 2
+    return len(parts) - 2
 
 
-def contains_shortener(hostname: str) -> int:
-    """
-    Detect known URL-shortening domains.
-    """
+def get_tld_length(hostname: str) -> int:
+    if not hostname:
+        return 0
 
-    hostname = hostname.lower()
+    if is_ip_address(hostname):
+        return 0
 
-    for domain in SHORTENER_DOMAINS:
+    parts = [
+        part
+        for part in hostname.split(".")
+        if part
+    ]
 
-        if (
-            hostname == domain
-            or hostname.endswith(
-                "." + domain
-            )
-        ):
+    if len(parts) < 2:
+        return 0
+
+    return len(parts[-1])
+
+
+def is_shortened_url(hostname: str) -> int:
+    if not hostname:
+        return 0
+
+    for domain in SHORTENED_URL_DOMAINS:
+        if hostname == domain:
+            return 1
+
+        if hostname.endswith("." + domain):
             return 1
 
     return 0
-
-
-def count_suspicious_keywords(url: str) -> int:
-    """
-    Count suspicious security-related keywords.
-    """
-
-    lower_url = url.lower()
-
-    count = 0
-
-    for keyword in SUSPICIOUS_KEYWORDS:
-
-        if keyword in lower_url:
-            count += 1
-
-    return count
 
 
 def has_suspicious_extension(path: str) -> int:
-    """
-    Detect potentially dangerous downloadable extensions.
-    """
+    if not path:
+        return 0
 
-    lower_path = path.lower()
+    cleaned_path = unquote(path).lower().rstrip("/")
 
-    for extension in SUSPICIOUS_EXTENSIONS:
+    return int(
+        any(
+            cleaned_path.endswith(extension)
+            for extension in SUSPICIOUS_EXTENSIONS
+        )
+    )
 
-        if lower_path.endswith(
-            extension
-        ):
-            return 1
 
-    return 0
+def count_suspicious_keywords(text: str) -> int:
+    decoded = unquote(text).lower()
+
+    return sum(
+        1
+        for keyword in SUSPICIOUS_KEYWORDS
+        if keyword in decoded
+    )
+
+
+def calculate_entropy(text: str) -> float:
+    if not text:
+        return 0.0
+
+    length = len(text)
+    counts = Counter(text)
+
+    entropy = 0.0
+
+    for count in counts.values():
+        probability = count / length
+        entropy -= probability * math.log2(probability)
+
+    return entropy
+
+
+def calculate_ratio(
+    count: int,
+    total: int,
+) -> float:
+    if total == 0:
+        return 0.0
+
+    return count / total
+
+
+def get_explicit_port(parsed) -> int:
+    if parsed is None:
+        return 0
+
+    try:
+        return int(parsed.port is not None)
+    except ValueError:
+        return 0
+
+
+def get_query_parameter_count(query: str) -> int:
+    if not query:
+        return 0
+
+    try:
+        return len(
+            parse_qsl(
+                query,
+                keep_blank_values=True,
+            )
+        )
+    except ValueError:
+        return len(
+            [
+                part
+                for part in query.split("&")
+                if part
+            ]
+        )
+
+
+def get_path_depth(path: str) -> int:
+    if not path:
+        return 0
+
+    return len(
+        [
+            segment
+            for segment in path.split("/")
+            if segment
+        ]
+    )
 
 
 def extract_url_features(url: str) -> dict:
-    """
-    Extract numerical lexical cybersecurity features from one URL.
-    """
-
-    if url is None:
-        url = ""
-
-    url = str(url).strip()
-
-    (
-        parsed_url,
-        hostname,
-        parse_error,
-    ) = safe_parse_url(url)
-
-
-    if parsed_url is not None:
-
-        path = (
-            parsed_url.path or ""
+    if not isinstance(url, str):
+        raise TypeError(
+            "URL must be provided as a string."
         )
 
-        query = (
-            parsed_url.query or ""
+    raw_url = url.strip()
+
+    if not raw_url:
+        raise ValueError(
+            "URL cannot be empty."
         )
 
-        scheme = (
-            parsed_url.scheme or ""
-        ).lower()
+    parsed, parse_error = safe_parse_url(
+        raw_url
+    )
+
+    hostname = get_hostname(parsed)
+    hostname = normalize_hostname(hostname)
+
+    if parsed is not None:
+        path = normalize_path(
+            parsed.path or ""
+        )
+
+        query = parsed.query or ""
 
     else:
-
         path = ""
         query = ""
-        scheme = ""
 
+    # ---------------------------------------------------------
+    # Scheme-neutral representation
+    # ---------------------------------------------------------
+    #
+    # These should produce nearly identical lexical features:
+    #
+    # google.com
+    # http://google.com
+    # https://www.google.com
+    #
+    # Protocol formatting therefore cannot dominate the model.
 
-    # -----------------------------------
-    # Length features
-    # -----------------------------------
+    lexical_url = hostname + path
 
-    url_length = len(url)
+    if query:
+        lexical_url += "?" + query
 
-    hostname_length = len(hostname)
+    lexical_length = len(lexical_url)
 
-    path_length = len(path)
-
-    query_length = len(query)
-
-
-    # -----------------------------------
-    # Character counts
-    # -----------------------------------
+    # ---------------------------------------------------------
+    # Character statistics
+    # ---------------------------------------------------------
 
     digit_count = sum(
         character.isdigit()
-        for character in url
+        for character in lexical_url
     )
 
     letter_count = sum(
         character.isalpha()
-        for character in url
+        for character in lexical_url
     )
 
     special_character_count = sum(
         not character.isalnum()
-        for character in url
+        for character in lexical_url
     )
 
     non_ascii_count = sum(
         ord(character) > 127
-        for character in url
+        for character in lexical_url
     )
 
-
-    # -----------------------------------
-    # Ratios
-    # -----------------------------------
-
-    safe_length = max(
-        url_length,
-        1,
+    hostname_digit_count = sum(
+        character.isdigit()
+        for character in hostname
     )
 
-    digit_ratio = (
-        digit_count
-        / safe_length
+    hostname_special_count = sum(
+        not character.isalnum()
+        and character != "."
+        for character in hostname
     )
 
-    letter_ratio = (
-        letter_count
-        / safe_length
-    )
+    hostname_length = len(hostname)
 
-    special_character_ratio = (
-        special_character_count
-        / safe_length
-    )
-
-    non_ascii_ratio = (
-        non_ascii_count
-        / safe_length
-    )
-
-
-    # -----------------------------------
-    # Security indicators
-    # -----------------------------------
-
-    uses_https = int(
-        scheme == "https"
-    )
-
-    has_ip = contains_ip_address(
+    keyword_text = (
         hostname
+        + path
+        + "?"
+        + query
     )
 
-    subdomain_count = (
-        count_subdomains(
-            hostname
-        )
+    percent_encoding_text = (
+        path
+        + "?"
+        + query
     )
 
-    suspicious_keyword_count = (
-        count_suspicious_keywords(
-            url
-        )
-    )
+    # ---------------------------------------------------------
+    # Final feature dictionary
+    # ---------------------------------------------------------
 
-    shortened_url = (
-        contains_shortener(
-            hostname
-        )
-    )
+    return {
+        "url_length": lexical_length,
 
+        "hostname_length": hostname_length,
 
-    # -----------------------------------
-    # Explicit port
-    # -----------------------------------
+        "path_length": len(path),
 
-    has_explicit_port = 0
+        "query_length": len(query),
 
-    if parsed_url is not None:
+        "dot_count": lexical_url.count("."),
 
-        try:
-            has_explicit_port = int(
-                parsed_url.port
-                is not None
-            )
+        "hyphen_count": lexical_url.count("-"),
 
-        except ValueError:
-            has_explicit_port = 1
-            parse_error = 1
+        "underscore_count": lexical_url.count("_"),
 
+        "slash_count": path.count("/"),
 
-    # -----------------------------------
-    # Encoding
-    # -----------------------------------
+        "question_mark_count": (
+            1 if query else 0
+        ),
 
-    percent_encoding_count = len(
-        re.findall(
-            r"%[0-9A-Fa-f]{2}",
-            url,
-        )
-    )
+        "equal_count": query.count("="),
 
+        # @ is scheme-neutral, so preserve it from raw URL.
+        "at_count": raw_url.count("@"),
 
-    # -----------------------------------
-    # Path indicators
-    # -----------------------------------
+        "ampersand_count": query.count("&"),
 
-    double_slash_in_path = int(
-        "//" in path
-    )
+        "digit_count": digit_count,
 
-    suspicious_extension = (
-        has_suspicious_extension(
-            path
-        )
-    )
-
-
-    # -----------------------------------
-    # Final numerical feature dictionary
-    # -----------------------------------
-
-    features = {
-
-        "url_length":
-            url_length,
-
-        "hostname_length":
-            hostname_length,
-
-        "path_length":
-            path_length,
-
-        "query_length":
-            query_length,
-
-        "dot_count":
-            url.count("."),
-
-        "hyphen_count":
-            url.count("-"),
-
-        "underscore_count":
-            url.count("_"),
-
-        "slash_count":
-            url.count("/"),
-
-        "question_mark_count":
-            url.count("?"),
-
-        "equal_count":
-            url.count("="),
-
-        "at_count":
-            url.count("@"),
-
-        "ampersand_count":
-            url.count("&"),
-
-        "digit_count":
+        "digit_ratio": calculate_ratio(
             digit_count,
+            lexical_length,
+        ),
 
-        "digit_ratio":
-            round(
-                digit_ratio,
-                6,
-            ),
-
-        "letter_ratio":
-            round(
-                letter_ratio,
-                6,
-            ),
+        "letter_ratio": calculate_ratio(
+            letter_count,
+            lexical_length,
+        ),
 
         "special_character_count":
             special_character_count,
 
         "special_character_ratio":
-            round(
-                special_character_ratio,
-                6,
+            calculate_ratio(
+                special_character_count,
+                lexical_length,
             ),
 
-        "non_ascii_count":
-            non_ascii_count,
+        "non_ascii_count": non_ascii_count,
 
         "non_ascii_ratio":
-            round(
-                non_ascii_ratio,
-                6,
+            calculate_ratio(
+                non_ascii_count,
+                lexical_length,
             ),
 
-        "uses_https":
-            uses_https,
-
         "has_ip_address":
-            has_ip,
+            is_ip_address(hostname),
 
         "subdomain_count":
-            subdomain_count,
+            count_subdomains(hostname),
 
         "suspicious_keyword_count":
-            suspicious_keyword_count,
+            count_suspicious_keywords(
+                keyword_text
+            ),
 
         "shortened_url":
-            shortened_url,
+            is_shortened_url(hostname),
 
         "has_explicit_port":
-            has_explicit_port,
+            get_explicit_port(parsed),
 
         "percent_encoding_count":
-            percent_encoding_count,
+            len(
+                re.findall(
+                    r"%[0-9A-Fa-f]{2}",
+                    percent_encoding_text,
+                )
+            ),
 
         "double_slash_in_path":
-            double_slash_in_path,
+            int("//" in path),
 
         "suspicious_extension":
-            suspicious_extension,
+            has_suspicious_extension(path),
 
         "url_parse_error":
             parse_error,
 
         "url_entropy":
-            round(
-                calculate_entropy(
-                    url
-                ),
-                6,
+            calculate_entropy(
+                lexical_url
             ),
-    }
 
-    return features
+        # -----------------------------------------------------
+        # New v2 structural features
+        # -----------------------------------------------------
+
+        "hostname_digit_ratio":
+            calculate_ratio(
+                hostname_digit_count,
+                hostname_length,
+            ),
+
+        "hostname_special_ratio":
+            calculate_ratio(
+                hostname_special_count,
+                hostname_length,
+            ),
+
+        "path_depth":
+            get_path_depth(path),
+
+        "query_parameter_count":
+            get_query_parameter_count(
+                query
+            ),
+
+        "tld_length":
+            get_tld_length(hostname),
+    }
