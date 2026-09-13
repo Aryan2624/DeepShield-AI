@@ -1,16 +1,22 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.url_analysis import router as url_analysis_router
 from app.core.config import get_settings
 
 
 settings = get_settings()
 
+
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="AI-powered cybersecurity threat detection and monitoring platform.",
+    description=(
+        "AI-powered cybersecurity threat "
+        "detection and monitoring platform."
+    ),
 )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,6 +27,11 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+
+app.include_router(
+    url_analysis_router
 )
 
 

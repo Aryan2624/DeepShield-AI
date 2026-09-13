@@ -1,0 +1,15 @@
+{
+    "model_name": "Hist Gradient Boosting Standard",
+    "benchmark_samples": 31956,
+    "accuracy": 0.9456440105144573,
+    "precision_macro": 0.9560767095383044,
+    "recall_macro": 0.9393258434186255,
+    "f1_macro": 0.9473067364711375,
+    "f1_weighted": 0.9456620400411625,
+    "roc_auc_macro": 0.9913978323803123,
+    "classes": [
+        "defacement",
+        "malware",
+        "phishing"
+    ]
+}

@@ -16,4 +16,12 @@ export async function getHealthStatus() {
   return response.data;
 }
 
+export async function analyzeUrl(url) {
+  const response = await api.post("/api/url/analyze", {
+    url,
+  });
+
+  return response.data;
+}
+
 export default api;
